@@ -22,7 +22,6 @@ func main() {
 	// 设置全局变量 ReplaceNumbersInWords 为 true，启用替换标识符中数字的功能
 	// 注意：这是一个全局开关，会影响所有 Fingerprint 调用
 	query.ReplaceNumbersInWords = true
-
 	rawSql = "select app_name, user_name from users_00 where id = 1;"
 	fmt.Println("rawSql:" + rawSql)
 	parsed = query.Fingerprint(rawSql)

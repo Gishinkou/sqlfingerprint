@@ -1,0 +1,410 @@
+package query
+
+import (
+	"crypto/md5"
+	"fmt"
+	"io"
+	"strings"
+)
+
+const (
+	unknown byte = iota
+	inWord
+	inNumber
+	inSpace
+	inOp
+	opOrNumber
+	inQuote
+	subOrOLC
+	inDash
+	inOLC
+	divOrMLC
+	mlcOrMySQLCode
+	inMLC
+	inValues
+	moreValuesOrUnknown
+	orderBy
+	onDupeKeyUpdate
+	inNumberInWord
+	inBackticks
+	inMySQLCode
+)
+
+var stateName map[byte]string = map[byte]string{
+	0:  "unknown",
+	1:  "inWord",
+	2:  "inNumber",
+	3:  "inSpace",
+	4:  "inOp",
+	5:  "opOrNumber",
+	6:  "inQuote",
+	7:  "subOrOLC",
+	8:  "inDash",
+	9:  "inOLC",
+	10: "divOrMLC",
+	11: "mlcOrMySQLCode",
+	12: "inMLC",
+	13: "inValues",
+	14: "moreValuesOrUnknown",
+	15: "orderBy",
+	16: "onDupeKeyUpdate",
+	17: "inNumberInWord",
+	18: "inBackTicks",
+	19: "inMySQLCode",
+}
+var Debug bool = false
+var ReplaceNumbersInWords = false
+
+func Fingerprint(q string) string {
+	q += " "
+	prevWord := ""
+	f := make([]byte, len(q))
+	fi := 0
+	pr := rune(0)
+	s := unknown
+	sqlState := unknown
+	quoteChar := rune(0)
+	cpFromOffset := 0
+	cpToOffset := 0
+	addSpace := false
+	escape := false
+	parOpen := 0
+	parOpenTotal := 0
+	valueNo := 0
+	firstPar := 0
+	for qi, r := range q {
+		if s == inQuote {
+			if r != quoteChar {
+				if escape {
+					escape = false
+				} else if r == '\\' {
+					escape = true
+				} else {
+				}
+			} else if escape {
+				escape = false
+			} else {
+				escape = false
+				cpFromOffset = qi + 1
+				if sqlState == inValues {
+					s = inValues
+				} else {
+					f[fi] = '?'
+					fi++
+					s = unknown
+				}
+			}
+			continue
+		} else if s == inBackticks {
+			if r != '`' {
+				if escape {
+					escape = false
+				} else if r == '\\' {
+					escape = true
+				} else {
+				}
+			} else if escape {
+				escape = false
+			} else {
+				escape = false
+				cpToOffset = qi + 1
+				s = inWord
+			}
+			continue
+		} else if s == inNumberInWord {
+			if r >= '0' && r <= '9' {
+				continue
+			}
+			f[fi] = '?'
+			fi++
+			cpFromOffset = qi
+			if isSpace(r) {
+				s = unknown
+			} else {
+				s = inWord
+			}
+		} else if s == inNumber {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '.' || r == 'x' || r == '-' {
+				continue
+			}
+			if (r >= 'g' && r <= 'z') || (r >= 'G' && r <= 'Z') || r == '_' {
+				cpToOffset = qi
+				s = inWord
+			} else if sqlState == inMySQLCode {
+				cpToOffset = qi
+				s = inWord
+				sqlState = unknown
+			} else {
+				f[fi] = '?'
+				fi++
+				cpFromOffset = qi
+				cpToOffset = qi
+				s = unknown
+			}
+		} else if s == inValues {
+			if r == ')' {
+				parOpen--
+				parOpenTotal++
+			} else if r == '(' {
+				parOpen++
+				if parOpen == 1 {
+					firstPar = qi
+				}
+			} else if r == '\'' || r == '"' {
+				s = inQuote
+				quoteChar = r
+				continue
+			} else if isSpace(r) {
+				continue
+			}
+			if parOpen > 0 {
+				continue
+			}
+			if parOpenTotal == 0 {
+				s = inWord
+				continue
+			}
+			valueNo++
+			if valueNo == 1 {
+				if qi-firstPar > 1 {
+					content := strings.ToLower(strings.TrimSpace(q[firstPar+1 : qi]))
+					if strings.HasPrefix(content, "select") {
+						subqueryFingerprint := Fingerprint(q[firstPar+1 : qi])
+						subqueryResult := "(" + subqueryFingerprint + ")"
+						copy(f[fi:fi+len(subqueryResult)], subqueryResult)
+						fi += len(subqueryResult)
+					} else {
+						copy(f[fi:fi+4], "(?+)")
+						fi += 4
+					}
+				} else {
+					copy(f[fi:fi+2], "()")
+					fi += 2
+				}
+				firstPar = 0
+			}
+			s = moreValuesOrUnknown
+			pr = r
+			cpFromOffset = qi + 1
+			parOpenTotal = 0
+			continue
+		} else if s == inMLC {
+			if pr == '*' && r == '/' {
+				s = unknown
+			} else {
+				pr = r
+			}
+			continue
+		} else if s == mlcOrMySQLCode {
+			if r != '!' {
+				pr = r
+				s = inMLC
+				continue
+			} else {
+				s = inWord
+				sqlState = inMySQLCode
+			}
+		} else if s == inOLC {
+			if r == 0x0A {
+				s = unknown
+			}
+			continue
+		} else if isSpace(r) && isSpace(pr) {
+			cpFromOffset = qi + 1
+			pr = r
+			continue
+		}
+		switch {
+		case r >= 0x30 && r <= 0x39:
+			switch s {
+			case opOrNumber:
+				cpToOffset = qi - 1
+				s = inNumber
+			case inOp:
+				cpToOffset = qi
+				s = inNumber
+			case inWord:
+				if pr == '(' {
+					cpToOffset = qi
+					s = inNumber
+				} else if pr == ',' {
+					s = inNumber
+					cpToOffset = qi
+				} else {
+					if ReplaceNumbersInWords {
+						s = inNumberInWord
+						cpToOffset = qi
+					}
+				}
+			default:
+				s = inNumber
+				cpToOffset = qi
+			}
+		case isSpace(r):
+			if s == unknown {
+				if fi > 0 && !isSpace(rune(f[fi-1])) {
+					f[fi] = ' '
+					fi++
+				}
+				cpFromOffset = qi + 1
+			} else if s == inDash {
+				s = inOLC
+				if cpToOffset > 2 {
+					cpToOffset = qi - 2
+				}
+			} else if s == moreValuesOrUnknown {
+				if valueNo == 1 {
+					f[fi] = ' '
+					fi++
+				}
+			} else {
+				word := strings.ToLower(q[cpFromOffset:qi])
+				if word == "use" && prevWord == "" {
+					return "use ?"
+				} else if (word == "null" && (prevWord != "is" && prevWord != "not")) || word == "null," {
+					f[fi] = '?'
+					fi++
+					if word[len(word)-1] == ',' {
+						f[fi] = ','
+						fi++
+					}
+					f[fi] = ' '
+					fi++
+					cpFromOffset = qi + 1
+				} else if prevWord == "order" && word == "by" {
+					sqlState = orderBy
+				} else if sqlState == orderBy && wordIn(word, "asc", "asc,", "asc ") {
+					cpFromOffset = qi
+					if word[len(word)-1] == ',' {
+						fi--
+						f[fi] = ','
+						f[fi+1] = ' '
+						fi += 2
+					}
+				} else if prevWord == "key" && word == "update" {
+					sqlState = onDupeKeyUpdate
+				}
+				s = inSpace
+				cpToOffset = qi
+				addSpace = true
+			}
+		case r == '\'' || r == '"':
+			if pr != '\\' {
+				if s != inQuote {
+					s = inQuote
+					quoteChar = r
+					cpToOffset = qi
+					if pr == 'x' || pr == 'b' {
+						cpToOffset = -2
+					}
+				}
+			}
+		case r == '`':
+			if pr != '\\' {
+				if s != inBackticks {
+					s = inBackticks
+				}
+			}
+		case r == '=' || r == '<' || r == '>' || r == '!':
+			if s != inWord && s != inOp {
+				cpFromOffset = qi
+			}
+			s = inOp
+		case r == '/':
+			s = divOrMLC
+		case r == '*' && s == divOrMLC:
+			s = mlcOrMySQLCode
+		case r == '+':
+			s = opOrNumber
+		case r == '-':
+			if pr == '-' {
+				s = inDash
+			} else {
+				s = opOrNumber
+			}
+		case r == '.':
+			if s == inNumber || s == inOp {
+				s = inNumber
+				cpToOffset = qi
+			}
+		case r == '(':
+			if prevWord == "call" {
+				return "call " + q[cpFromOffset:qi]
+			} else if sqlState != onDupeKeyUpdate && (((s == inSpace || s == moreValuesOrUnknown) && (prevWord == "value" || prevWord == "values" || prevWord == "in")) || wordIn(q[cpFromOffset:qi], "value", "values", "in")) {
+				s = inValues
+				sqlState = inValues
+				parOpen = 1
+				firstPar = qi
+				if valueNo == 0 {
+					cpToOffset = qi
+				}
+			} else if s != inWord {
+				valueNo = 0
+				cpFromOffset = qi
+				s = inWord
+			}
+		case r == ',' && s == moreValuesOrUnknown:
+		case r == ':' && prevWord == "administrator":
+			return q[0 : len(q)-1]
+		case r == '#':
+			addSpace = false
+			s = inOLC
+		default:
+			if s != inWord && s != inOp {
+				valueNo = 0
+				cpFromOffset = qi
+				if sqlState == inValues {
+					sqlState = unknown
+				}
+			}
+			s = inWord
+		}
+		if cpToOffset > cpFromOffset {
+			l := cpToOffset - cpFromOffset
+			prevWord = strings.ToLower(q[cpFromOffset:cpToOffset])
+			copy(f[fi:fi+l], prevWord)
+			fi += l
+			cpFromOffset = cpToOffset
+			valueKeywords := []string{"in", "value", "values"}
+			if wordIn(prevWord, valueKeywords...) && sqlState != onDupeKeyUpdate {
+				addSpace = false
+				if r == '(' || (isSpace(r) && qi+1 < len(q) && ((q[qi+1] == '(') || (q[qi+1] == ' '))) {
+					s = inValues
+					sqlState = inValues
+				} else {
+					f[fi] = ' '
+					fi++
+					cpFromOffset++
+				}
+			} else if addSpace {
+				f[fi] = ' '
+				fi++
+				cpFromOffset++
+				addSpace = false
+			}
+		}
+		pr = r
+	}
+	for fi > 0 && isSpace(rune(f[fi-1])) {
+		fi--
+	}
+	return strings.Replace(string(f[0:fi]), "\x00", "", -1)
+}
+func isSpace(r rune) bool {
+	return r == 0x20 || r == 0x09 || r == 0x0D || r == 0x0A
+}
+func wordIn(q string, words ...string) bool {
+	q = strings.ToLower(q)
+	for _, word := range words {
+		if q == word {
+			return true
+		}
+	}
+	return false
+}
+func Id(fingerprint string) string {
+	id := md5.New()
+	io.WriteString(id, fingerprint)
+	h := fmt.Sprintf("%x", id.Sum(nil))
+	return strings.ToUpper(h[16:32])
+}
